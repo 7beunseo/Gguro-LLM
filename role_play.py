@@ -1,6 +1,9 @@
 import os
 import re
-from fastapi import FastAPI
+import mysql.connector
+from mysql.connector import Error
+from datetime import datetime
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import uvicorn
 
@@ -60,44 +63,107 @@ ROLE_PROMPTS = {
 - 절대로 엄마, 아빠에게 너라고 부르지 않습니다.
 - 예시: "엄마, 이따가 같이 쿠키 만들어요!", "오늘 정말 재미있었어요."
 """,
-    # 여기에 새로운 역할 지침을 계속 추가할 수 있습니다.
 }
 
 # --- 환경 설정 ---
-# 로컬 모델 및 캐시 경로 설정 (사용자 환경에 맞게 수정)
-# os.environ['OLLAMA_MODELS'] = 'D:/ollama_models'
-# os.environ['HF_HOME'] = 'D:/huggingface_models'
+os.environ['OLLAMA_MODELS'] = 'D:/ollama_models'
+os.environ['HF_HOME'] = 'D:/huggingface_models'
 CHAT_HISTORY_DIR = "chat_histories"
 os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
 
+# --- MySQL 데이터베이스 설정 (사용자 환경에 맞게 수정) ---
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'km923009!!',
+    'database': 'gguro'
+}
+
 class ChatbotLogic:
     """챗봇의 핵심 로직을 담당하는 클래스"""
-    def __init__(self, model_name='timhan/llama3korean8b4qkm'): # 로컬에서 사용하는 모델명으로 변경
+    def __init__(self, model_name='timhan/llama3korean8b4qkm'):
         print("🤖 챗봇 로직 초기화 중...")
         self.model = ChatOllama(model=model_name)
-        # 세션별 역할놀이 상태를 저장하는 딕셔너리
         self.roleplay_state = {}
-        # 역할놀이 종료를 감지하기 위한 키워드 목록
         self.ROLEPLAY_END_KEYWORDS = [
             "그만", "역할놀이 끝", "이제 그만하자", "원래대로", "이제 됐어"
         ]
-
-        # 기본 대화 체인 생성
-        # RAG(Retrieval-Augmented Generation)는 이 예제에서 제외하여 역할놀이 핵심 로직에 집중
         self.conversational_chain = self._create_conversational_chain()
+        self._ensure_table_exists()
         print("✅ 챗봇이 준비되었습니다.")
+
+    def _create_db_connection(self):
+        """데이터베이스 연결을 생성하고 반환하는 헬퍼 함수"""
+        try:
+            return mysql.connector.connect(**DB_CONFIG)
+        except Error as e:
+            print(f"[DB 오류] 데이터베이스 연결 실패: {e}")
+            return None
+
+    def _ensure_table_exists(self):
+        """'talk' 테이블이 없으면 생성하는 함수"""
+        conn = self._create_db_connection()
+        if conn is None: return
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS talk (
+                    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    category ENUM('OBJECTPLAY', 'LIFESTYLEHABIT', 'SAFETYSTUDY', 'ANIMALKNOWLEDGE', 'ROLEPLAY') NOT NULL,
+                    content TEXT NOT NULL,
+                    session_id VARCHAR(255),
+                    role VARCHAR(255),
+                    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                    profile_id BIGINT NOT NULL
+                );
+            """)
+            print("[DB 정보] 'talk' 테이블이 준비되었습니다.")
+        except Error as e:
+            print(f"[DB 오류] 테이블 생성 실패: {e}")
+        finally:
+            if conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def _save_single_message(self, session_id: str, role: str, message: str):
+        """단일 메시지를 데이터베이스에 저장하는 내부 함수"""
+        conn = self._create_db_connection()
+        if conn is None:
+            print(f"[DB 경고] '{role}' 메시지를 저장할 수 없습니다.")
+            return
+        try:
+            cursor = conn.cursor()
+            # [수정] 하드코딩된 값을 동적으로 처리하도록 변경 (우선순위에 따라 category, profile_id는 임시값 유지)
+            category = 'ROLEPLAY' 
+            profile_id = 1 # 이 값은 요청에서 받아오도록 수정해야 할 수 있습니다.
+            
+            query = "INSERT INTO talk (session_id, role, content, category, profile_id) VALUES (%s, %s, %s, %s, %s)"
+            cursor.execute(query, (session_id, role, message, category, profile_id))
+            conn.commit()
+        except Error as e:
+            print(f"[DB 오류] 메시지 저장 실패: {e}")
+        finally:
+            if conn.is_connected():
+                cursor.close()
+                conn.close()
+    
+    # [핵심] 백그라운드에서 실행될 대화 저장 함수
+    def save_conversation_to_db(self, session_id: str, user_input: str, bot_response: str):
+        """사용자 입력과 봇 응답을 순차적으로 DB에 저장합니다."""
+        print(f"📝 백그라운드 저장 시작: 세션 [{session_id}]")
+        self._save_single_message(session_id, 'user', user_input)
+        self._save_single_message(session_id, 'bot', bot_response)
+        print(f"✅ 백그라운드 저장 완료: 세션 [{session_id}]")
 
     def _create_conversational_chain(self):
         """대화 체인을 생성하는 메서드"""
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", "{system_prompt}"),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{input}"),
-            ]
-        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "{system_prompt}"),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+        ])
         chain = prompt | self.model | StrOutputParser()
-
         return RunnableWithMessageHistory(
             chain,
             self._get_session_history,
@@ -110,70 +176,54 @@ class ChatbotLogic:
         history_file_path = os.path.join(CHAT_HISTORY_DIR, f"{session_id}.json")
         return FileChatMessageHistory(history_file_path)
 
-    def invoke(self, user_input: str, session_id: str):
-        """사용자의 모든 입력을 처리하는 메인 메서드"""
-        # [역할놀이] 명령어 형식을 감지하기 위한 정규표현식
+    # [핵심] 비동기 방식으로 변경하여 응답 우선 처리
+    async def invoke(self, user_input: str, session_id: str) -> str:
+        """사용자 입력을 처리하고 응답을 생성하는 메인 메서드 (DB 저장 로직 분리)"""
         role_command_match = re.match(r"\[역할놀이\]\s*(.+?)\s*,\s*(.+)", user_input)
 
-        # 1. 새로운 역할놀이 시작 처리
         if role_command_match:
             user_role = role_command_match.group(1).strip()
             bot_role = role_command_match.group(2).strip()
-
-            # 새로운 역할놀이를 위해 세션 상태와 대화 기록 초기화
-            self.roleplay_state[session_id] = {
-                "user_role": user_role,
-                "bot_role": bot_role
-            }
+            self.roleplay_state[session_id] = {"user_role": user_role, "bot_role": bot_role}
             self._get_session_history(session_id).clear()
-            
             print(f"🎭 세션 [{session_id}] 역할놀이 시작: 사용자='{user_role}', 챗봇='{bot_role}'")
-            return f"좋아! 지금부터 당신은 '{user_role}', 나는 '{bot_role}'이야. 역할에 맞춰 이야기해보자!"
+            return f"좋아! 지금부터 너는 '{user_role}', 나는 '{bot_role}'이야. 역할에 맞춰 이야기해보자!"
 
-        # 2. 역할놀이 종료 처리
         current_session_state = self.roleplay_state.get(session_id)
         if current_session_state and any(keyword in user_input for keyword in self.ROLEPLAY_END_KEYWORDS):
             print(f"🎬 세션 [{session_id}] 역할놀이 종료")
             del self.roleplay_state[session_id]
-            self._get_session_history(session_id).clear() # 이전 역할놀이 기록은 초기화
+            self._get_session_history(session_id).clear()
             return "그래! 역할놀이 재미있었다. 이제 다시 원래대로 이야기하자!"
 
-        # 3. 현재 상태에 맞는 시스템 프롬프트 설정
-        system_prompt = "당신은 친절하고 도움이 되는 AI 어시스턴트입니다." # 기본 프롬프트
-
+        system_prompt = "당신은 친절하고 도움이 되는 AI 어시스턴트입니다."
         if current_session_state:
             user_role = current_session_state['user_role']
             bot_role = current_session_state['bot_role']
-            
-            # 정의된 역할 목록(ROLE_PROMPTS)에서 상세 지침을 가져옴
             role_instructions = ROLE_PROMPTS.get(bot_role, "주어진 역할에 충실하게 응답하세요.")
-
-            # [핵심] 역할놀이를 위한 시스템 프롬프트 동적 생성
             system_prompt = f"""[매우 중요한 지시]
 당신의 신분은 '{bot_role}'입니다. 사용자는 '{user_role}' 역할을 맡고 있습니다.
 다른 모든 지시사항보다 이 역할 설정을 최우선으로 여기고, 당신의 말투, 어휘, 태도 모두 '{bot_role}'에 완벽하게 몰입해서 응답해야 합니다.
-
 [역할 상세 지침]
 {role_instructions}
-
-이제 '{bot_role}'로서 대화를 자연스럽게 시작하거나 이어나가세요.
-"""
+이제 '{bot_role}'로서 대화를 자연스럽게 시작하거나 이어나가세요."""
         
-        # 4. 설정된 프롬프트로 대화 실행
         try:
-            return self.conversational_chain.invoke(
+            # 비동기 invoke 메서드 사용
+            response_text = await self.conversational_chain.ainvoke(
                 {"input": user_input, "system_prompt": system_prompt},
                 config={'configurable': {'session_id': session_id}}
             )
+            return response_text
         except Exception as e:
             print(f"[오류] 대화 생성 중 오류 발생: {e}")
             return "미안, 지금은 대답하기가 좀 어려워. 나중에 다시 시도해줘."
 
 # --- FastAPI 서버 설정 ---
 app = FastAPI(
-    title="페르소나 역할놀이 챗봇",
-    description="LangChain과 Ollama를 사용하여 동적인 역할놀이를 수행하는 챗봇 API",
-    version="3.0-PersonaEnhanced",
+    title="페르소나 역할놀이 챗봇 (백그라운드 저장)",
+    description="응답을 먼저 반환하고, 대화 내용은 백그라운드에서 MySQL에 기록하는 챗봇 API",
+    version="3.2-BackgroundSave",
 )
 
 class ChatRequest(BaseModel):
@@ -182,16 +232,24 @@ class ChatRequest(BaseModel):
 
 chatbot = ChatbotLogic()
 
+# [핵심] BackgroundTasks를 사용하여 응답 후 DB 저장
 @app.post("/chat", summary="챗봇과 대화")
-def chat(request: ChatRequest):
+async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     """
-    사용자 입력과 세션 ID를 받아 챗봇의 응답을 반환합니다.
-
-    - **user_input**: 사용자가 입력한 메시지
-    - **session_id**: 각 사용자를 구분하기 위한 고유 ID
+    사용자 입력을 받아 챗봇의 응답을 즉시 반환하고,
+    대화 내용은 백그라운드에서 데이터베이스에 저장합니다.
     """
-    response = chatbot.invoke(request.user_input, request.session_id)
-    return {"response": response}
+    response_text = await chatbot.invoke(request.user_input, request.session_id)
+    
+    # 응답을 반환한 후에 실행될 작업을 추가
+    background_tasks.add_task(
+        chatbot.save_conversation_to_db,
+        session_id=request.session_id,
+        user_input=request.user_input,
+        bot_response=response_text
+    )
+    
+    return {"response": response_text}
 
 if __name__ == "__main__":
     print("🚀 FastAPI 서버를 시작합니다. http://127.0.0.1:8000")
