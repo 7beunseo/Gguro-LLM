@@ -1,21 +1,41 @@
 import os
+import sys
+import random
 import re
-import mysql.connector
-from mysql.connector import Error
-from datetime import datetime
+# --- [DB 변경] 'mysql.connector' 대신 'psycopg2'를 임포트합니다. ---
+import psycopg2
+from psycopg2 import Error
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import uvicorn
 
-# LangChain 관련 라이브러리 임포트
+# Ollama 및 허깅페이스 모델의 로컬 경로를 지정합니다.
+os.environ['OLLAMA_MODELS'] = 'D:/ollama_models'
+os.environ['HF_HOME'] = 'D:/huggingface_models'
+
+# LangChain 관련 라이브러리들을 가져옵니다.
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_community.chat_message_histories import FileChatMessageHistory
+from langchain_community.vectorstores import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
 
-# --- 역할별 상세 지침 (새로운 역할 추가/수정이 용이하도록 분리) ---
+# --- [DB 변경] PostgreSQL 데이터베이스 설정 (사용자 환경에 맞게 수정) ---
+DB_CONFIG = {
+    'dbname': 'gguro',                  # 사용할 데이터베이스(스키마) 이름
+    'user': 'postgres',       # PostgreSQL 사용자 이름
+    'password': 'km923009!!', # PostgreSQL 비밀번호
+    'host': 'localhost',                # 데이터베이스 호스트 주소
+    'port': '5432'                      # PostgreSQL 기본 포트
+}
+
+# --- [추가] 역할놀이 상세 지침 ---
 ROLE_PROMPTS = {
     "어부": """
 - 당신은 거친 바다와 평생을 함께한 베테랑 어부입니다.
@@ -65,193 +85,346 @@ ROLE_PROMPTS = {
 """,
 }
 
-# --- 환경 설정 ---
-os.environ['OLLAMA_MODELS'] = 'D:/ollama_models'
-os.environ['HF_HOME'] = 'D:/huggingface_models'
-CHAT_HISTORY_DIR = "chat_histories"
-os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
-
-# --- MySQL 데이터베이스 설정 (사용자 환경에 맞게 수정) ---
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': 'km923009!!',
-    'database': 'gguro'
-}
-
+# --- 챗봇 로직 클래스 (최종 수정 버전) ---
 class ChatbotLogic:
-    """챗봇의 핵심 로직을 담당하는 클래스"""
     def __init__(self, model_name='timhan/llama3korean8b4qkm'):
-        print("🤖 챗봇 로직 초기화 중...")
+        print("🤖 역할놀이 챗봇 로딩 시작...")
         self.model = ChatOllama(model=model_name)
+        self.store = {}
+        
+        # [수정] 역할놀이 및 일반 대화 종료 키워드 정의
+        self.ROLEPLAY_END_KEYWORDS = ["역할놀이 끝", "원래대로"]
+        self.END_KEYWORDS = ["끝", "종료", "그만", "대화 종료"]
+        
+        # 역할놀이 상태 관리
         self.roleplay_state = {}
-        self.ROLEPLAY_END_KEYWORDS = [
-            "그만", "역할놀이 끝", "이제 그만하자", "원래대로", "이제 됐어"
-        ]
-        self.conversational_chain = self._create_conversational_chain()
-        self._ensure_table_exists()
-        print("✅ 챗봇이 준비되었습니다.")
 
-    def _create_db_connection(self):
-        """데이터베이스 연결을 생성하고 반환하는 헬퍼 함수"""
+        # 분석용 체인들 초기화
+        self.analysis_chain = self._create_analysis_chain()
+        self.summarization_chain = self._create_summarization_chain()
+        self.conversational_chain = self._create_conversational_chain()
+
+        # DB 테이블 준비
+        self._ensure_table_exists()
+
+        if all([self.conversational_chain, self.analysis_chain, self.summarization_chain]):
+            print("✅ 챗봇 로직이 정상적으로 로드되었습니다.")
+        else:
+            print("[중요] 챗봇 로직 초기화에 실패했습니다!")
+
+    def _get_base_prompt(self):
+        """기본 시스템 프롬프트를 반환합니다."""
+        return "당신은 아이들의 눈높이에 맞춰 대화하는 다정한 AI 친구 '꾸로'입니다. 항상 친절하고 상냥하게 대답해주세요."
+
+    def _create_analysis_chain(self):
+        """텍스트의 감정을 분석하고 키워드를 추출하는 LangChain 체인을 생성합니다."""
         try:
-            return mysql.connector.connect(**DB_CONFIG)
+            prompt = ChatPromptTemplate.from_template("""당신은 주어진 텍스트에서 사용자의 감정과 그 대상이 되는 핵심 키워드를 추출하는 전문가입니다.
+텍스트를 분석하여 긍정적인지 부정적인지 판단하고, 감정과 관련된 **핵심 대상과 감정 단어**를 모두 포함하여 키워드를 3개 이내로 추출하세요.
+결과는 반드시 다음 형식으로만 출력해야 합니다. 다른 설명은 절대 추가하지 마세요.
+[예시]
+분석할 텍스트: 난 참외 싫어해
+[판단: 부정]
+[키워드: 참외, 싫어]
+---
+분석할 텍스트:
+{text}
+---
+""")
+            return prompt | self.model | StrOutputParser()
+        except Exception as e:
+            print(f"[오류] 감정 분석 체인 생성 중 문제 발생: {e}"); return None
+
+    def _create_summarization_chain(self):
+        """대화 내용을 요약하는 체인을 생성합니다."""
+        try:
+            prompt = ChatPromptTemplate.from_template("""다음 [대화 내용]을 한 문장으로 요약해줘. 요약 결과 외에 다른 설명은 절대 붙이지 마.
+[대화 내용]:
+{history}
+---
+[요약]:""")
+            return prompt | self.model | StrOutputParser()
+        except Exception as e:
+            print(f"[오류] 요약 체인 생성 중 문제 발생: {e}"); return None
+            
+    def _create_conversational_chain(self):
+        """대화 체인을 생성합니다."""
+        try:
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", "{system_prompt}"),
+                MessagesPlaceholder(variable_name="chat_history"),
+                ("human", "{input}"),
+            ])
+            
+            chain = prompt | self.model | StrOutputParser()
+
+            return RunnableWithMessageHistory(
+                chain,
+                self._get_session_history,
+                input_messages_key="input",
+                history_messages_key="chat_history",
+                system_message_key="system_prompt" 
+            )
+        except Exception as e:
+            print(f"[오류] 대화 체인 설정 중 심각한 문제 발생: {e}"); return None
+
+    def _get_session_history(self, session_id: str):
+        """세션별 대화 기록 객체를 관리합니다."""
+        if session_id not in self.store:
+            self.store[session_id] = {'history': InMemoryChatMessageHistory(), 'chatroom_id': None}
+        return self.store[session_id]['history']
+    
+    def _create_db_connection(self):
+        """PostgreSQL 데이터베이스 연결을 생성합니다."""
+        try:
+            return psycopg2.connect(**DB_CONFIG)
         except Error as e:
-            print(f"[DB 오류] 데이터베이스 연결 실패: {e}")
-            return None
+            print(f"[DB 오류] PostgreSQL 데이터베이스 연결 실패: {e}"); return None
 
     def _ensure_table_exists(self):
-        """'talk' 테이블이 없으면 생성하는 함수"""
+        """데이터베이스에 ChatRoom과 Talk 테이블 및 관련 객체들을 생성합니다."""
         conn = self._create_db_connection()
         if conn is None: return
         try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS talk (
-                    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                    category ENUM('OBJECTPLAY', 'LIFESTYLEHABIT', 'SAFETYSTUDY', 'ANIMALKNOWLEDGE', 'ROLEPLAY') NOT NULL,
-                    content TEXT NOT NULL,
-                    session_id VARCHAR(255),
-                    role VARCHAR(255),
-                    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-                    profile_id BIGINT NOT NULL
-                );
-            """)
-            print("[DB 정보] 'talk' 테이블이 준비되었습니다.")
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS chatroom (
+                        id BIGSERIAL PRIMARY KEY,
+                        profile_id BIGINT NOT NULL,
+                        topic TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS talk (
+                        id BIGSERIAL PRIMARY KEY,
+                        chatroom_id BIGINT NOT NULL REFERENCES chatroom(id),
+                        category VARCHAR(50) NOT NULL CHECK (category IN ('OBJECTPLAY', 'LIFESTYLEHABIT', 'SAFETYSTUDY', 'ANIMALKNOWLEDGE', 'ROLEPLAY')),
+                        content TEXT NOT NULL,
+                        session_id VARCHAR(255),
+                        role VARCHAR(255),
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        profile_id BIGINT NOT NULL,
+                        "like" BOOLEAN,
+                        positive BOOLEAN DEFAULT TRUE,
+                        keywords TEXT[]
+                    );
+                """)
+                cursor.execute("""
+                    CREATE OR REPLACE FUNCTION update_updated_at_column()
+                    RETURNS TRIGGER AS $$
+                    BEGIN
+                       NEW.updated_at = NOW(); 
+                       RETURN NEW;
+                    END;
+                    $$ language 'plpgsql';
+                """)
+                cursor.execute("""
+                    DROP TRIGGER IF EXISTS update_talk_updated_at ON talk;
+                    CREATE TRIGGER update_talk_updated_at
+                    BEFORE UPDATE ON talk
+                    FOR EACH ROW
+                    EXECUTE FUNCTION update_updated_at_column();
+                """)
+            conn.commit()
+            print("[DB 정보] 'chatroom' 및 'talk' 테이블이 준비되었습니다.")
         except Error as e:
-            print(f"[DB 오류] 테이블 생성 실패: {e}")
+            print(f"[DB 오류] 테이블 생성 실패: {e}"); conn.rollback()
         finally:
-            if conn.is_connected():
-                cursor.close()
-                conn.close()
-
-    def _save_single_message(self, session_id: str, role: str, message: str):
-        """단일 메시지를 데이터베이스에 저장하는 내부 함수"""
-        conn = self._create_db_connection()
-        if conn is None:
-            print(f"[DB 경고] '{role}' 메시지를 저장할 수 없습니다.")
+            if conn: conn.close()
+    
+    async def _summarize_and_close_room(self, session_id: str):
+        """현재 채팅방을 요약하고, 세션에서 채팅방 ID를 제거하여 대화를 종료 상태로 만듭니다."""
+        session_state = self.store.get(session_id)
+        if not session_state or not session_state.get('chatroom_id'):
             return
+
+        current_chatroom_id = session_state['chatroom_id']
+        history = session_state['history']
+        
+        if history.messages:
+            conn = self._create_db_connection()
+            if conn is None: return
+            try:
+                with conn.cursor() as cursor:
+                    full_history_str = "\n".join([f"{msg.type}: {msg.content}" for msg in history.messages])
+                    summary = await self.summarization_chain.ainvoke({"history": full_history_str})
+                    summary = summary.strip().replace("'", "''")
+                    
+                    # [수정] 역할놀이 요약 시, 저장 형식을 변경합니다.
+                    if session_id in self.roleplay_state:
+                        summary = f"[역할놀이] {summary}"
+                    
+                    cursor.execute("UPDATE chatroom SET topic = %s WHERE id = %s", (summary, current_chatroom_id))
+                    conn.commit()
+                    print(f"채팅방({current_chatroom_id}) 요약 완료 및 저장: {summary}")
+            except Error as e:
+                print(f"[DB 오류] 채팅방 요약 중 오류: {e}"); conn.rollback()
+            finally:
+                if conn: conn.close()
+
+        session_state['chatroom_id'] = None
+        history.clear()
+        if session_id in self.roleplay_state:
+            del self.roleplay_state[session_id]
+        print(f"세션({session_id})의 채팅방이 종료되었습니다.")
+
+    async def _create_new_chatroom(self, session_id: str, profile_id: int):
+        """새로운 채팅방을 생성하고 세션에 ID를 할당합니다."""
+        session_state = self.store.setdefault(session_id, {'history': InMemoryChatMessageHistory(), 'chatroom_id': None})
+        conn = self._create_db_connection()
+        if conn is None: return None
         try:
-            cursor = conn.cursor()
-            # [수정] 하드코딩된 값을 동적으로 처리하도록 변경 (우선순위에 따라 category, profile_id는 임시값 유지)
-            category = 'ROLEPLAY' 
-            profile_id = 1 # 이 값은 요청에서 받아오도록 수정해야 할 수 있습니다.
-            
-            query = "INSERT INTO talk (session_id, role, content, category, profile_id) VALUES (%s, %s, %s, %s, %s)"
-            cursor.execute(query, (session_id, role, message, category, profile_id))
+            with conn.cursor() as cursor:
+                topic = "새로운 역할놀이" if session_id in self.roleplay_state else "새로운 대화"
+                cursor.execute("INSERT INTO chatroom (profile_id, topic) VALUES (%s, %s) RETURNING id", (profile_id, topic))
+                new_chatroom_id = cursor.fetchone()[0]
+                session_state['chatroom_id'] = new_chatroom_id
+                conn.commit()
+                print(f"새 채팅방 생성: {new_chatroom_id}")
+                return new_chatroom_id
+        except Error as e:
+            print(f"[DB 오류] 새 채팅방 생성 중 오류: {e}"); conn.rollback()
+            return None
+        finally:
+            if conn: conn.close()
+
+    async def _analyze_and_save_message(self, session_id: str, role: str, text: str, profile_id: int, chatroom_id: int):
+        """메시지를 분석하고 DB에 저장하는 내부 헬퍼 함수"""
+        if not self.analysis_chain:
+            is_positive, keywords_list = True, []
+        else:
+            try:
+                analysis_result = await self.analysis_chain.ainvoke({"text": text})
+                is_positive = "부정" not in analysis_result
+                keywords_match = re.search(r"\[키워드:\s*(.*)\]", analysis_result)
+                keywords_list = [k.strip() for k in keywords_match.group(1).split(',') if k.strip()] if keywords_match else []
+                print(f"분석 결과 ({'긍정' if is_positive else '부정'}): {text} -> {keywords_list}")
+            except Exception as e:
+                print(f"[오류] '{text}' 분석 중 오류 발생: {e}"); is_positive, keywords_list = True, []
+
+        conn = self._create_db_connection()
+        if conn is None: return
+        try:
+            with conn.cursor() as cursor:
+                query = """
+                    INSERT INTO talk (session_id, role, content, category, profile_id, positive, keywords, "like", chatroom_id) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s)
+                """
+                category = 'ROLEPLAY' if session_id in self.roleplay_state else 'LIFESTYLEHABIT'
+                cursor.execute(query, (session_id, role, text, category, profile_id, is_positive, keywords_list, chatroom_id))
             conn.commit()
         except Error as e:
-            print(f"[DB 오류] 메시지 저장 실패: {e}")
+            print(f"[DB 오류] 메시지 저장 실패: {e}"); conn.rollback()
         finally:
-            if conn.is_connected():
-                cursor.close()
-                conn.close()
-    
-    # [핵심] 백그라운드에서 실행될 대화 저장 함수
-    def save_conversation_to_db(self, session_id: str, user_input: str, bot_response: str):
-        """사용자 입력과 봇 응답을 순차적으로 DB에 저장합니다."""
-        print(f"📝 백그라운드 저장 시작: 세션 [{session_id}]")
-        self._save_single_message(session_id, 'user', user_input)
-        self._save_single_message(session_id, 'bot', bot_response)
-        print(f"✅ 백그라운드 저장 완료: 세션 [{session_id}]")
+            if conn: conn.close()
 
-    def _create_conversational_chain(self):
-        """대화 체인을 생성하는 메서드"""
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "{system_prompt}"),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-        ])
-        chain = prompt | self.model | StrOutputParser()
-        return RunnableWithMessageHistory(
-            chain,
-            self._get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-        )
+    async def save_conversation_to_db(self, session_id: str, user_input: str, bot_response: str, chatroom_id: int, profile_id: int):
+        """사용자 입력과 봇 응답을 분석하고 순차적으로 DB에 저장합니다."""
+        print(f"📝 백그라운드 저장 및 분석 시작: 채팅방 [{chatroom_id}]")
+        await self._analyze_and_save_message(session_id, 'user', user_input, profile_id, chatroom_id)
+        await self._analyze_and_save_message(session_id, 'bot', bot_response, profile_id, chatroom_id)
+        print(f"✅ 백그라운드 저장 및 분석 완료: 채팅방 [{chatroom_id}]")
 
-    def _get_session_history(self, session_id: str):
-        """세션 ID에 해당하는 대화 기록 파일을 가져오는 메서드"""
-        history_file_path = os.path.join(CHAT_HISTORY_DIR, f"{session_id}.json")
-        return FileChatMessageHistory(history_file_path)
-
-    # [핵심] 비동기 방식으로 변경하여 응답 우선 처리
-    async def invoke(self, user_input: str, session_id: str) -> str:
-        """사용자 입력을 처리하고 응답을 생성하는 메인 메서드 (DB 저장 로직 분리)"""
+    async def invoke(self, user_input: str, session_id: str, profile_id: int):
+        """챗봇의 메인 실행 함수. 역할놀이, 대화 종료, 채팅방 관리, 응답 생성을 총괄합니다."""
+        
+        # 1. 역할놀이 시작 명령어 확인
         role_command_match = re.match(r"\[역할놀이\]\s*(.+?)\s*,\s*(.+)", user_input)
-
         if role_command_match:
-            user_role = role_command_match.group(1).strip()
-            bot_role = role_command_match.group(2).strip()
-            self.roleplay_state[session_id] = {"user_role": user_role, "bot_role": bot_role}
-            self._get_session_history(session_id).clear()
-            print(f"🎭 세션 [{session_id}] 역할놀이 시작: 사용자='{user_role}', 챗봇='{bot_role}'")
-            return f"좋아! 지금부터 너는 '{user_role}', 나는 '{bot_role}'이야. 역할에 맞춰 이야기해보자!"
+            user_role, bot_role = role_command_match.groups()
+            await self._summarize_and_close_room(session_id)
+            
+            self.roleplay_state[session_id] = {"user_role": user_role.strip(), "bot_role": bot_role.strip()}
+            print(f"🎭 세션 [{session_id}] 역할놀이 시작: 사용자='{user_role.strip()}', 챗봇='{bot_role.strip()}'")
+            
+            chatroom_id = await self._create_new_chatroom(session_id, profile_id)
+            response_text = f"좋아! 지금부터 너는 '{user_role.strip()}', 나는 '{bot_role.strip()}'이야. 역할에 맞춰 이야기해보자!"
+            return response_text, chatroom_id
 
-        current_session_state = self.roleplay_state.get(session_id)
-        if current_session_state and any(keyword in user_input for keyword in self.ROLEPLAY_END_KEYWORDS):
-            print(f"🎬 세션 [{session_id}] 역할놀이 종료")
-            del self.roleplay_state[session_id]
-            self._get_session_history(session_id).clear()
-            return "그래! 역할놀이 재미있었다. 이제 다시 원래대로 이야기하자!"
+        # 2. 역할놀이 종료 명령어 확인
+        if session_id in self.roleplay_state and any(keyword in user_input for keyword in self.ROLEPLAY_END_KEYWORDS):
+            await self._summarize_and_close_room(session_id)
+            return "그래! 역할놀이 재미있었다. 이제 다시 원래대로 이야기하자!", None
 
-        system_prompt = "당신은 친절하고 도움이 되는 AI 어시스턴트입니다."
-        if current_session_state:
-            user_role = current_session_state['user_role']
-            bot_role = current_session_state['bot_role']
+        # [추가] 일반 대화 종료 명령어 확인
+        if session_id not in self.roleplay_state and any(keyword in user_input for keyword in self.END_KEYWORDS):
+            await self._summarize_and_close_room(session_id)
+            return "알겠습니다. 대화를 종료하고 요약했습니다. 새로운 대화를 시작할 수 있습니다.", None
+
+        # 3. 현재 세션의 채팅방 ID 가져오거나 새로 생성
+        session_state = self.store.get(session_id, {})
+        chatroom_id = session_state.get('chatroom_id')
+
+        if not chatroom_id:
+            print(f"세션({session_id})에 활성 채팅방이 없어 새로 시작합니다.")
+            chatroom_id = await self._create_new_chatroom(session_id, profile_id)
+            if not chatroom_id:
+                return "채팅방을 만드는 데 문제가 발생했어요.", None
+
+        if not self.conversational_chain:
+            return "챗봇 로직 초기화에 실패했습니다.", chatroom_id
+            
+        # 4. 시스템 프롬프트 결정 및 응답 생성
+        system_prompt_text = self._get_base_prompt()
+        if session_id in self.roleplay_state:
+            state = self.roleplay_state[session_id]
+            bot_role = state['bot_role']
             role_instructions = ROLE_PROMPTS.get(bot_role, "주어진 역할에 충실하게 응답하세요.")
-            system_prompt = f"""[매우 중요한 지시]
-당신의 신분은 '{bot_role}'입니다. 사용자는 '{user_role}' 역할을 맡고 있습니다.
+            system_prompt_text = f"""[매우 중요한 지시]
+당신의 신분은 '{bot_role}'입니다. 사용자는 '{state['user_role']}' 역할을 맡고 있습니다.
 다른 모든 지시사항보다 이 역할 설정을 최우선으로 여기고, 당신의 말투, 어휘, 태도 모두 '{bot_role}'에 완벽하게 몰입해서 응답해야 합니다.
 [역할 상세 지침]
 {role_instructions}
 이제 '{bot_role}'로서 대화를 자연스럽게 시작하거나 이어나가세요."""
-        
+
         try:
-            # 비동기 invoke 메서드 사용
-            response_text = await self.conversational_chain.ainvoke(
-                {"input": user_input, "system_prompt": system_prompt},
+            response = await self.conversational_chain.ainvoke(
+                {"input": user_input, "system_prompt": system_prompt_text},
                 config={'configurable': {'session_id': session_id}}
             )
-            return response_text
+            return response, chatroom_id
         except Exception as e:
-            print(f"[오류] 대화 생성 중 오류 발생: {e}")
-            return "미안, 지금은 대답하기가 좀 어려워. 나중에 다시 시도해줘."
+            print(f"[오류] 대화 생성 중 문제 발생: {e}")
+            return "미안, 지금은 대답하기가 좀 힘들어.", chatroom_id
 
 # --- FastAPI 서버 설정 ---
-app = FastAPI(
-    title="페르소나 역할놀이 챗봇 (백그라운드 저장)",
-    description="응답을 먼저 반환하고, 대화 내용은 백그라운드에서 MySQL에 기록하는 챗봇 API",
-    version="3.2-BackgroundSave",
-)
+app = FastAPI(title="역할놀이 챗봇 (채팅방 자동 관리)")
 
 class ChatRequest(BaseModel):
     user_input: str
     session_id: str
+    # profile_id: int
 
-chatbot = ChatbotLogic()
+chatbot_logic = ChatbotLogic()
 
-# [핵심] BackgroundTasks를 사용하여 응답 후 DB 저장
-@app.post("/chat", summary="챗봇과 대화")
+@app.post("/chat", summary="챗봇과 대화하기")
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     """
     사용자 입력을 받아 챗봇의 응답을 즉시 반환하고,
-    대화 내용은 백그라운드에서 데이터베이스에 저장합니다.
+    대화 내용은 백그라운드에서 분석 후 데이터베이스에 저장합니다.
     """
-    response_text = await chatbot.invoke(request.user_input, request.session_id)
+    profile_id = 1 # 임시 프로필 ID
+    response_text, chatroom_id = await chatbot_logic.invoke(request.user_input, request.session_id, profile_id)
     
-    # 응답을 반환한 후에 실행될 작업을 추가
-    background_tasks.add_task(
-        chatbot.save_conversation_to_db,
-        session_id=request.session_id,
-        user_input=request.user_input,
-        bot_response=response_text
-    )
+    # [수정] 모든 종료 명령어들을 확인하도록 수정
+    is_end_command = any(keyword in request.user_input for keyword in chatbot_logic.ROLEPLAY_END_KEYWORDS + chatbot_logic.END_KEYWORDS) or \
+                     re.match(r"\[역할놀이\]", request.user_input)
+
+    if chatroom_id and not is_end_command:
+        background_tasks.add_task(
+            chatbot_logic.save_conversation_to_db,
+            session_id=request.session_id,
+            user_input=request.user_input,
+            bot_response=response_text,
+            chatroom_id=chatroom_id,
+            profile_id=profile_id
+        )
     
     return {"response": response_text}
 
+# uvicorn으로 이 파일을 실행하기 위한 메인 블록
 if __name__ == "__main__":
-    print("🚀 FastAPI 서버를 시작합니다. http://127.0.0.1:8000")
-    print("📄 API 문서는 http://127.0.0.1:8000/docs 에서 확인하세요.")
+    print("🚀 FastAPI 서버를 시작합니다. http://127.0.0.1:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000)
