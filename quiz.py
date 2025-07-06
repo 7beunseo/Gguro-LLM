@@ -317,6 +317,7 @@ class ChatbotLogic:
         if session_id in self.quiz_mode:
             del self.quiz_mode[session_id]
         print(f"세션({session_id})의 채팅방이 종료되었습니다.")
+        
 
     async def _create_new_chatroom(self, session_id: str, profile_id: int):
         """새로운 채팅방을 생성하고 세션에 ID를 할당합니다."""
